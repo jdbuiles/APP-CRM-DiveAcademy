@@ -1047,7 +1047,7 @@
         <!-- PESTAÑA: CONFIGURACIÓN / CONECTOR -->
         <div id="tab-settings" class="hidden max-w-2xl bg-tangaroa border border-slate-800 rounded-3xl p-6 shadow-xl">
           <h2 class="text-base font-black title-font text-white uppercase tracking-tight mb-2">Conector de Google Drive</h2>
-          <p class="text-xs text-slate-400 mb-6">Inserta la URL de conexión generada en tu Apps Script para sincronizar las cuentas de buzos de forma automática.</p>
+          <p class="text-xs text-slate-400 mb-6">https://script.google.com/macros/s/AKfycbyq7CggHvP5P-w-b1GsGRXm-lzkDmY3EjteicbAKUqqZlrgNWzKfYCHG6_6mKdlcvz5aQ/exec</p>
 
           <form id="settings-form" class="space-y-4 text-xs">
             <div>
@@ -1368,6 +1368,60 @@
     let providers = JSON.parse(localStorage.getItem('da_providers')) || [...INITIAL_PROVIDERS];
     let localHistory = JSON.parse(localStorage.getItem('da_history')) || [...INITIAL_HISTORY];
     let offlineQueue = JSON.parse(localStorage.getItem('da_offline_queue')) || [];
+    let isSyncingRemote = false;
+    let pollingIntervalId = null;
+
+    // --- COMUNICACIÓN REAL CON EL BACKEND (Google Sheets = fuente de verdad) ---
+    // IMPORTANTE: ya no se usa mode:'no-cors', así sí podemos leer la respuesta del servidor.
+    async function postToServer(payload) {
+      const res = await fetch(scriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      });
+      const json = await res.json();
+      if (json.status !== 'success') throw new Error(json.message || json.error || 'Error desconocido del servidor.');
+      return json;
+    }
+
+    function queueOffline(action, payload) {
+      offlineQueue.push({ action, apiKey: securityToken, ...payload });
+      saveAllToLocalStorage();
+      updateConnectionBadge();
+    }
+
+    // Trae el estado real desde Google Sheets (cuentas, clientes, proveedores, viajes, historial)
+    async function fetchAllFromServer({ silent = true } = {}) {
+      if (!scriptUrl || !navigator.onLine || isSyncingRemote) return;
+      isSyncingRemote = true;
+      try {
+        const url = scriptUrl + '?action=getAll&apiKey=' + encodeURIComponent(securityToken);
+        const res = await fetch(url);
+        const json = await res.json();
+        if (json.status === 'success') {
+          accounts = json.accounts && json.accounts.length ? json.accounts : accounts;
+          clients = json.clients || [];
+          providers = json.providers || [];
+          trips = (json.trips || []).map(t => ({ ...t, currency: t.currency || 'COP' }));
+          localHistory = json.history || [];
+          saveAllToLocalStorage();
+          initApp();
+          if (!silent) showToast('Datos actualizados desde Google Sheets.', 'success');
+        } else if (!silent) {
+          showToast('No se pudo leer Google Sheets: ' + (json.message || json.error || ''), 'error');
+        }
+      } catch (err) {
+        if (!silent) showToast('Error de conexión al leer Google Sheets.', 'error');
+      } finally {
+        isSyncingRemote = false;
+      }
+    }
+
+    function startPolling() {
+      if (pollingIntervalId) clearInterval(pollingIntervalId);
+      if (!scriptUrl) return;
+      pollingIntervalId = setInterval(() => fetchAllFromServer({ silent: true }), 20000); // cada 20s
+    }
 
     let currentTxType = 'income';
     let currentReceiptBase64 = null;
@@ -1572,7 +1626,7 @@
     }
 
     // Revertir y anular movimientos
-    function voidTransaction(id) {
+    async function voidTransaction(id) {
       const tx = localHistory.find(item => item.id === id);
       if (!tx) return;
 
@@ -1581,7 +1635,7 @@
       const rate = EXCHANGE_RATES[txCurrency] || 1;
       const amountInCOP = tx.amount * rate;
 
-      // Deshacer impacto en los saldos bancarios
+      // Deshacer impacto en los saldos bancarios (reflejo optimista)
       accounts = accounts.map(acc => {
         if (acc.name === tx.account) {
           const revertAmount = tx.type === 'income' ? -amountInCOP : amountInCOP;
@@ -1592,11 +1646,30 @@
 
       localHistory = localHistory.filter(item => item.id !== id);
       saveAllToLocalStorage();
-      showToast('Transacción anulada y balances restaurados.', 'info');
+
+      if (navigator.onLine && scriptUrl) {
+        try {
+          await postToServer({ action: 'voidTransaction', apiKey: securityToken, id, amountCOP: amountInCOP });
+          showToast('Transacción anulada y sincronizada con Google Sheets.', 'info');
+          await fetchAllFromServer({ silent: true });
+        } catch (err) {
+          queueOffline('voidTransaction', { id, amountCOP: amountInCOP });
+          showToast('Anulado localmente. Error al sincronizar: ' + err.message, 'error');
+        }
+      } else {
+        queueOffline('voidTransaction', { id, amountCOP: amountInCOP });
+        showToast('Anulado localmente (Modo Offline).', 'info');
+      }
+
       initApp();
     }
 
     // --- EXPORTAR HISTORIAL A EXCEL (CSV) ---
+    function csvField(value) {
+      const str = String(value ?? '');
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+
     function exportToCSV() {
       let csvContent = "data:text/csv;charset=utf-8,";
       csvContent += "ID,Fecha,Tipo,Monto,Divisa,Cuenta,Categoria,Concepto,Tercero\n";
@@ -1608,10 +1681,10 @@
           item.type,
           item.amount,
           item.currency || 'COP',
-          `"${item.account}"`,
-          `"${item.category}"`,
-          `"${item.concept}"`,
-          `"${item.client}"`
+          csvField(item.account),
+          csvField(item.category),
+          csvField(item.concept),
+          csvField(item.client)
         ].join(",");
         csvContent += row + "\n";
       });
@@ -1671,12 +1744,7 @@
       const remainingQueue = [];
       for (const payload of offlineQueue) {
         try {
-          await fetch(scriptUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify(payload)
-          });
+          await postToServer(payload);
         } catch (err) {
           remainingQueue.push(payload);
         }
@@ -1685,7 +1753,12 @@
       offlineQueue = remainingQueue;
       saveAllToLocalStorage();
       updateConnectionBadge();
-      showToast('Sincronización masiva con Google finalizada.', 'success');
+      if (remainingQueue.length === 0) {
+        showToast('Sincronización con Google Sheets finalizada.', 'success');
+      } else {
+        showToast(`${remainingQueue.length} borrador(es) no se pudieron sincronizar.`, 'error');
+      }
+      await fetchAllFromServer({ silent: true });
     }
 
     // --- GESTIÓN DE TERCEROS EN FORMULARIO GENERAL ---
@@ -2199,11 +2272,11 @@
         receipt: currentReceiptBase64 ? 'Adjunto' : null
       };
 
-      // Convertir el monto ingresado a COP para afectar los saldos locales unificados de las cuentas físicas
+      // Convertir el monto ingresado a COP para afectar los saldos unificados de las cuentas físicas
       const rate = EXCHANGE_RATES[currency] || 1;
       const amountInCOP = amount * rate;
 
-      // Afectar balance de banco físico de forma correcta en COP
+      // Reflejo optimista en pantalla (se reconcilia con el servidor en el siguiente fetch)
       accounts = accounts.map(a => {
         if (a.name === account) {
           const diff = currentTxType === 'income' ? amountInCOP : -amountInCOP;
@@ -2215,23 +2288,19 @@
       localHistory.unshift(newTx);
       saveAllToLocalStorage();
 
-      // Enviar a Drive si hay conexión
+      const payload = { action: 'addTransaction', apiKey: securityToken, ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentReceiptBase64 };
+
       if (navigator.onLine && scriptUrl) {
         try {
-          await fetch(scriptUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            body: JSON.stringify({ action: 'addTransaction', apiKey: securityToken, ...newTx, receiptBase64: currentReceiptBase64 })
-          });
-          showToast('Registro sincronizado con Google Drive.', 'success');
+          await postToServer(payload);
+          showToast('Registro sincronizado con Google Sheets.', 'success');
+          await fetchAllFromServer({ silent: true });
         } catch (err) {
-          offlineQueue.push({ ...newTx, receiptBase64: currentReceiptBase64 });
-          saveAllToLocalStorage();
-          showToast('Guardado localmente. Error al sincronizar.', 'error');
+          queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentReceiptBase64 });
+          showToast('Guardado localmente. Error al sincronizar: ' + err.message, 'error');
         }
       } else {
-        offlineQueue.push({ ...newTx, receiptBase64: currentReceiptBase64 });
-        saveAllToLocalStorage();
+        queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentReceiptBase64 });
         showToast('Guardado localmente (Modo Offline).', 'info');
       }
 
@@ -2283,21 +2352,19 @@
       localHistory.unshift(newTx);
       saveAllToLocalStorage();
 
+      const payload = { action: 'addTransaction', apiKey: securityToken, ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentQuickReceiptBase64 };
+
       if (navigator.onLine && scriptUrl) {
         try {
-          await fetch(scriptUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            body: JSON.stringify({ action: 'addTransaction', apiKey: securityToken, ...newTx, receiptBase64: currentQuickReceiptBase64 })
-          });
-          showToast('Sincronizado.', 'success');
+          await postToServer(payload);
+          showToast('Sincronizado con Google Sheets.', 'success');
+          await fetchAllFromServer({ silent: true });
         } catch (err) {
-          offlineQueue.push({ ...newTx, receiptBase64: currentQuickReceiptBase64 });
-          saveAllToLocalStorage();
+          queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentQuickReceiptBase64 });
+          showToast('Guardado localmente. Error al sincronizar.', 'error');
         }
       } else {
-        offlineQueue.push({ ...newTx, receiptBase64: currentQuickReceiptBase64 });
-        saveAllToLocalStorage();
+        queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentQuickReceiptBase64 });
       }
 
       document.getElementById('quick-abono-form').reset();
@@ -2352,20 +2419,17 @@
       localHistory.unshift(newTx);
       saveAllToLocalStorage();
 
+      const payload = { action: 'addTransaction', apiKey: securityToken, ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripIncReceiptBase64 };
+
       if (navigator.onLine && scriptUrl) {
         try {
-          await fetch(scriptUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            body: JSON.stringify({ action: 'addTransaction', apiKey: securityToken, ...newTx, receiptBase64: currentTripIncReceiptBase64 })
-          });
+          await postToServer(payload);
+          await fetchAllFromServer({ silent: true });
         } catch (err) {
-          offlineQueue.push({ ...newTx, receiptBase64: currentTripIncReceiptBase64 });
-          saveAllToLocalStorage();
+          queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripIncReceiptBase64 });
         }
       } else {
-        offlineQueue.push({ ...newTx, receiptBase64: currentTripIncReceiptBase64 });
-        saveAllToLocalStorage();
+        queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripIncReceiptBase64 });
       }
 
       document.getElementById('trip-income-form').reset();
@@ -2419,20 +2483,17 @@
       localHistory.unshift(newTx);
       saveAllToLocalStorage();
 
+      const payload = { action: 'addTransaction', apiKey: securityToken, ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripExpReceiptBase64 };
+
       if (navigator.onLine && scriptUrl) {
         try {
-          await fetch(scriptUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            body: JSON.stringify({ action: 'addTransaction', apiKey: securityToken, ...newTx, receiptBase64: currentTripExpReceiptBase64 })
-          });
+          await postToServer(payload);
+          await fetchAllFromServer({ silent: true });
         } catch (err) {
-          offlineQueue.push({ ...newTx, receiptBase64: currentTripExpReceiptBase64 });
-          saveAllToLocalStorage();
+          queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripExpReceiptBase64 });
         }
       } else {
-        offlineQueue.push({ ...newTx, receiptBase64: currentTripExpReceiptBase64 });
-        saveAllToLocalStorage();
+        queueOffline('addTransaction', { ...newTx, amountCOP: amountInCOP, currentUser, receiptBase64: currentTripExpReceiptBase64 });
       }
 
       document.getElementById('trip-expense-form').reset();
@@ -2441,7 +2502,7 @@
       initApp();
     });
 
-    document.getElementById('trip-config-form').addEventListener('submit', function(e) {
+    document.getElementById('trip-config-form').addEventListener('submit', async function(e) {
       e.preventDefault();
       const name = document.getElementById('trip-conf-name').value.trim();
       const start = document.getElementById('trip-conf-start').value;
@@ -2453,27 +2514,31 @@
       const currency = document.getElementById('trip-conf-currency').value;
       const notes = document.getElementById('trip-conf-notes').value.trim() || 'Ninguna.';
 
-      const newTrip = {
-        name,
-        start,
-        end,
-        price,
-        budget,
-        capacity,
-        status,
-        currency,
-        notes
-      };
+      const newTrip = { name, start, end, price, budget, capacity, status, currency, notes };
 
       trips.push(newTrip);
       saveAllToLocalStorage();
-      showToast('Destino logístico planificado con éxito.', 'success');
+
+      if (navigator.onLine && scriptUrl) {
+        try {
+          await postToServer({ action: 'addTrip', apiKey: securityToken, ...newTrip });
+          showToast('Destino logístico planificado y sincronizado.', 'success');
+          await fetchAllFromServer({ silent: true });
+        } catch (err) {
+          queueOffline('addTrip', newTrip);
+          showToast('Guardado localmente. Error al sincronizar: ' + err.message, 'error');
+        }
+      } else {
+        queueOffline('addTrip', newTrip);
+        showToast('Destino guardado localmente (Modo Offline).', 'info');
+      }
+
       document.getElementById('trip-config-form').reset();
       initApp();
     });
 
     // --- NUEVO CLIENTE ---
-    document.getElementById('client-form').addEventListener('submit', function(e) {
+    document.getElementById('client-form').addEventListener('submit', async function(e) {
       e.preventDefault();
       const name = document.getElementById('client-name').value.trim();
       const idNumber = document.getElementById('client-id-number').value.trim();
@@ -2510,14 +2575,28 @@
 
       clients.push(newCl);
       saveAllToLocalStorage();
-      showToast('Cliente guardado.', 'success');
+
+      if (navigator.onLine && scriptUrl) {
+        try {
+          await postToServer({ action: 'addClient', apiKey: securityToken, ...newCl });
+          showToast('Cliente guardado y sincronizado.', 'success');
+          await fetchAllFromServer({ silent: true });
+        } catch (err) {
+          queueOffline('addClient', newCl);
+          showToast('Guardado localmente. Error al sincronizar: ' + err.message, 'error');
+        }
+      } else {
+        queueOffline('addClient', newCl);
+        showToast('Cliente guardado localmente (Modo Offline).', 'info');
+      }
+
       document.getElementById('client-form').reset();
       toggleNewClientCard();
       initApp();
     });
 
     // --- NUEVO PROVEEDOR ---
-    document.getElementById('provider-form').addEventListener('submit', function(e) {
+    document.getElementById('provider-form').addEventListener('submit', async function(e) {
       e.preventDefault();
       const name = document.getElementById('provider-name').value.trim();
       const nit = document.getElementById('provider-nit').value.trim();
@@ -2548,7 +2627,21 @@
 
       providers.push(newPr);
       saveAllToLocalStorage();
-      showToast('Proveedor comercial guardado.', 'success');
+
+      if (navigator.onLine && scriptUrl) {
+        try {
+          await postToServer({ action: 'addProvider', apiKey: securityToken, ...newPr });
+          showToast('Proveedor comercial guardado y sincronizado.', 'success');
+          await fetchAllFromServer({ silent: true });
+        } catch (err) {
+          queueOffline('addProvider', newPr);
+          showToast('Guardado localmente. Error al sincronizar: ' + err.message, 'error');
+        }
+      } else {
+        queueOffline('addProvider', newPr);
+        showToast('Proveedor guardado localmente (Modo Offline).', 'info');
+      }
+
       document.getElementById('provider-form').reset();
       toggleNewProviderCard();
       initApp();
@@ -2578,6 +2671,8 @@
       localStorage.setItem('da_security_token', securityToken);
       showToast('Enlace de Google Drive y token actualizados.', 'success');
       updateConnectionBadge();
+      fetchAllFromServer({ silent: false });
+      startPolling();
       switchTab('dashboard');
     });
 
@@ -2622,7 +2717,13 @@
 
     window.onload = function() {
       initApp();
-      window.addEventListener('online', updateConnectionBadge);
+      fetchAllFromServer({ silent: true }).then(() => syncDrafts());
+      startPolling();
+      window.addEventListener('online', () => {
+        updateConnectionBadge();
+        fetchAllFromServer({ silent: true }).then(() => syncDrafts());
+        startPolling();
+      });
       window.addEventListener('offline', updateConnectionBadge);
     }
   </script>
